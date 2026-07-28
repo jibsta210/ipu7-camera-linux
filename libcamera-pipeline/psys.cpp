@@ -43,7 +43,7 @@ int PsysDevice::open(const std::string &deviceNode)
 		return -EBUSY;
 	}
 
-	int fd = ::open(deviceNode.c_str(), O_RDWR);
+	int fd = ::open(deviceNode.c_str(), O_RDWR | O_NONBLOCK);
 	if (fd < 0) {
 		int ret = -errno;
 		LOG(IPU7, Error) << "Failed to open " << deviceNode

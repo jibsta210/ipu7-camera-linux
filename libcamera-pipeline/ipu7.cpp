@@ -18,6 +18,8 @@
  */
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <linux/dma-buf.h>
 #include <memory>
@@ -27,6 +29,12 @@
 #include <unistd.h>
 #include <vector>
 
+/* EREMOTEIO (121) is used by the I2C subsystem for remote I/O errors */
+#ifndef EREMOTEIO
+#define EREMOTEIO 121
+#endif
+
+#include <libcamera/base/event_notifier.h>
 #include <libcamera/base/log.h>
 #include <libcamera/base/utils.h>
 
@@ -34,7 +42,9 @@
 #include <libcamera/control_ids.h>
 #include <libcamera/formats.h>
 #include <libcamera/property_ids.h>
+
 #include <libcamera/stream.h>
+#include <libcamera/transform.h>
 
 #include "libcamera/internal/camera.h"
 #include "libcamera/internal/dma_buf_allocator.h"
@@ -211,6 +221,7 @@ public:
 	int setupPsys(const std::string &psysDevNode);
 
 	void isysBufferReady(FrameBuffer *buffer);
+	void psysEventReady();
 
 	/* ISYS (V4L2) */
 	std::unique_ptr<CameraSensor> sensor_;
@@ -250,19 +261,32 @@ public:
 	std::queue<Request *> pendingRequests_;
 	uint8_t frameCounter_ = 0;
 
+	/* Async PSYS completion */
+	std::unique_ptr<EventNotifier> psysNotifier_;
+	struct PendingFrame {
+		FrameBuffer *rawBuffer = nullptr;
+		Request *request = nullptr;
+		uint8_t frameId = 0;
+		int eventsRemaining = 0;
+	};
+	PendingFrame pendingFrame_;
+
+	/* Queue for raw frames waiting for PSYS (only one at a time can process) */
+	std::queue<std::pair<FrameBuffer *, Request *>> psysQueue_;
+
 	/* Simple auto-exposure state */
 	static constexpr int32_t kAeExposureMin = 4;
 	static constexpr int32_t kAeExposureMax = 4992;
-	static constexpr int32_t kAeAGainMin = 128;
-	static constexpr int32_t kAeAGainMax = 1984;
-	static constexpr int32_t kAeDGainMin = 1024;
-	static constexpr int32_t kAeDGainMax = 4095;
+	static constexpr int32_t kAeAGainMin = 128;	/* 1.0x */
+	static constexpr int32_t kAeAGainMax = 1024;	/* 8.0x */
+	static constexpr int32_t kAeDGainMin = 1024;	/* 1.0x */
+	static constexpr int32_t kAeDGainMax = 2560;	/* 2.5x — sensor default */
 	static constexpr uint8_t kAeTargetLuma = 115;
 	static constexpr unsigned int kAeSkipFrames = 3;
 
 	struct {
 		int32_t exposure = 4992;
-		int32_t analogueGain = 800;
+		int32_t analogueGain = 512;
 		int32_t digitalGain = 2560;
 		unsigned int framesSinceUpdate = 0;
 		bool enabled = true;
@@ -272,13 +296,32 @@ public:
 	void updateAutoExposure(const void *nv12Data, unsigned int width,
 				unsigned int height);
 
+	/* Software AWB — gray-world algorithm on NV12 UV channels */
+	static constexpr unsigned int kAwbSkipFrames = 5;
+	static constexpr float kAwbDamping = 0.5f;
+	static constexpr float kAwbMaxCorrection = 30.0f;
+
+	struct {
+		float uCorrection = 0.0f;
+		float vCorrection = 0.0f;
+		unsigned int framesSinceUpdate = 0;
+		bool enabled = true;
+	} awb_;
+
+	void updateAwb(const void *nv12Data, unsigned int width,
+		       unsigned int height);
+	void applyAwb(void *nv12Data, unsigned int width,
+		      unsigned int height);
+
+
 	int allocateTerminalBuffers();
 	void loadTerminalParams();
 	void freeBuffers();
 
 private:
 	int openGraph();
-	void processRawFrame(FrameBuffer *rawBuffer, Request *request);
+	void submitFrame(FrameBuffer *rawBuffer, Request *request);
+	void completeFrame();
 };
 
 class IPU7CameraConfiguration : public CameraConfiguration
@@ -558,6 +601,14 @@ int PipelineHandlerIPU7::start(Camera *camera,
 
 	/* Reset frame counter — firmware expects frame IDs starting at 0 */
 	data->frameCounter_ = 0;
+	data->pendingFrame_ = {};
+
+	/* Set up async PSYS completion notifier */
+	data->psysNotifier_ = std::make_unique<EventNotifier>(
+		data->psys_.fd(), EventNotifier::Read);
+	data->psysNotifier_->activated.connect(
+		data, &IPU7CameraData::psysEventReady);
+	data->psysNotifier_->setEnabled(false);
 
 	/* Set initial sensor exposure/gain — AE loop adjusts per-frame */
 	data->ae_ = {};
@@ -575,6 +626,44 @@ void PipelineHandlerIPU7::stopDevice(Camera *camera)
 {
 	IPU7CameraData *data = cameraData(camera);
 
+	/* Disable the notifier first to stop receiving new events */
+	if (data->psysNotifier_)
+		data->psysNotifier_->setEnabled(false);
+
+	/*
+	 * Drain pending PSYS events before closing the graph. The firmware
+	 * may still be processing a frame — if we close the graph without
+	 * consuming its completion events, the firmware can deadlock on
+	 * the next graph open (hangs the resolution switch path).
+	 */
+	if (data->pendingFrame_.eventsRemaining > 0) {
+		LOG(IPU7, Debug) << "Draining " << data->pendingFrame_.eventsRemaining
+				 << " pending PSYS events before stop";
+		for (int retry = 0; retry < 100 && data->pendingFrame_.eventsRemaining > 0; retry++) {
+			uint8_t gid, nid, fid;
+			uint32_t error;
+			int ret = data->psys_.dqEvent(&gid, &nid, &fid, &error);
+			if (ret == -EAGAIN) {
+				usleep(1000); /* 1ms poll */
+				continue;
+			}
+			data->pendingFrame_.eventsRemaining--;
+		}
+	}
+
+	/* Complete the in-flight PSYS request (it's in queuedRequests_) */
+	if (data->pendingFrame_.request) {
+		Request *request = data->pendingFrame_.request;
+		for (const auto &[stream, buffer] : request->buffers()) {
+			buffer->_d()->cancel();
+			completeBuffer(request, buffer);
+		}
+		completeRequest(request);
+		if (data->pendingFrame_.rawBuffer)
+			data->availableIsysBuffers_.push(data->pendingFrame_.rawBuffer);
+		data->pendingFrame_ = {};
+	}
+
 	/* Cancel pending requests */
 	while (!data->pendingRequests_.empty()) {
 		Request *request = data->pendingRequests_.front();
@@ -587,7 +676,39 @@ void PipelineHandlerIPU7::stopDevice(Camera *camera)
 		completeRequest(request);
 	}
 
+	/* Cancel any queued PSYS frames that never got submitted */
+	while (!data->psysQueue_.empty()) {
+		auto [rawBuf, req] = data->psysQueue_.front();
+		data->psysQueue_.pop();
+		for (const auto &[stream, buf] : req->buffers()) {
+			buf->_d()->cancel();
+			completeBuffer(req, buf);
+		}
+		completeRequest(req);
+		data->availableIsysBuffers_.push(rawBuf);
+	}
+
+	data->psysNotifier_.reset();
+	data->pendingFrame_ = {};
+
 	data->isysCapture_->streamOff();
+
+	/*
+	 * Wait for the sensor runtime PM power-off to propagate through the
+	 * INT3472 discrete driver and the USBIO GPIO expander. streamOff()
+	 * triggers set_stream(0) in the sensor driver, which calls
+	 * pm_runtime_put(). The runtime PM autosuspend then invokes
+	 * ov08x40_power_off(), toggling GPIOs over the USB-connected USBIO
+	 * bridge. If PipeWire immediately restarts the camera (calling
+	 * configure() then start()), the USBIO bridge may still be processing
+	 * the power-off GPIO commands and can crash from the rapid USB bulk
+	 * transfer sequence, disconnecting and re-enumerating the SVP7500.
+	 *
+	 * A 500ms delay here lets the full power-off sequence complete before
+	 * any subsequent configure/start cycle begins.
+	 */
+	usleep(500000);
+
 	data->isysCapture_->releaseBuffers();
 	data->isysBuffers_.clear();
 	while (!data->availableIsysBuffers_.empty())
@@ -665,9 +786,11 @@ bool PipelineHandlerIPU7::match(DeviceEnumerator *enumerator)
 {
 	LOG(IPU7, Debug) << "match: looking for Intel IPU7 ISYS media device";
 
-	/* Look for the IPU7 ISYS media device */
+	/*
+	 * Look for the IPU7 ISYS media device. Only match on the capture
+	 * node — CSI2 subdevs may not have device nodes on newer kernels.
+	 */
 	DeviceMatch isysDm("intel-ipu7");
-	isysDm.add("Intel IPU7 CSI2 0");
 	isysDm.add("Intel IPU7 ISYS Capture 0");
 
 	isysMedia_ = acquireMediaDevice(enumerator, isysDm);
@@ -685,9 +808,18 @@ bool PipelineHandlerIPU7::match(DeviceEnumerator *enumerator)
 	 */
 	psysDevNode_ = "/dev/ipu7-psys0";
 	if (access(psysDevNode_.c_str(), R_OK | W_OK) < 0) {
+		/*
+		 * 2026-05-15: PSYS missing → fail match() so libcamera tries
+		 * the next pipeline handler (simple pipeline w/ software ISP).
+		 * Earlier attempt to "continue without PSYS" failed because
+		 * the IPU7 pipeline handler hard-requires PSYS at stream
+		 * configure() / start() time too — sensor → PSYS → NV12 is
+		 * the only configured path.  Falling through to simple pipeline
+		 * lets libcamera's software_isp module debayer in userspace.
+		 */
 		LOG(IPU7, Warning) << "PSYS device not accessible: " << psysDevNode_
-				   << " (errno=" << errno << " " << strerror(errno) << ")"
-				   << " — check permissions: chmod 666 " << psysDevNode_;
+				   << " — IPU7 pipeline declining match,"
+				   << " libcamera will try simple pipeline handler instead.";
 		return false;
 	}
 
@@ -718,6 +850,13 @@ int PipelineHandlerIPU7::registerCameras()
 
 		/* Set up properties from the sensor */
 		data->properties_ = data->sensor_->properties();
+
+		/*
+		 * Override rotation: Dell mounts this sensor inverted (180°).
+		 * The kernel driver reports rotation=0 incorrectly.
+		 * PipeWire uses this to apply GPU-accelerated rotation.
+		 */
+		data->properties_.set(properties::Rotation, 180);
 
 		/* Advertise supported controls */
 		ControlInfoMap::Map ctrls;
@@ -838,6 +977,42 @@ int IPU7CameraData::init(std::shared_ptr<MediaDevice> media, unsigned int csiInd
 
 	LOG(IPU7, Info) << "Initialized sensor " << sensor_->id()
 			<< " on " << csi2Name;
+
+	/*
+	 * Increase the sensor's runtime PM autosuspend delay. The ov08x40
+	 * kernel driver uses pm_runtime_put() in set_stream(0), which with
+	 * the default autosuspend delay causes near-immediate power-off via
+	 * INT3472. The power-off toggles GPIOs on the USBIO expander over USB,
+	 * and rapid power cycling crashes the USBIO bridge (Synaptics SVP7500).
+	 *
+	 * Setting a 2-second autosuspend delay means the sensor stays powered
+	 * for 2 seconds after streamOff, avoiding the race condition when
+	 * PipeWire immediately restarts the camera.
+	 *
+	 * sysfs path: /sys/bus/i2c/devices/<bus>-<addr>/power/autosuspend_delay_ms
+	 */
+	std::string sensorSysName = sensorEntity->name(); /* e.g. "ov08x40 17-0036" */
+	std::string sensorI2cAddr;
+	auto spacePos = sensorSysName.find(' ');
+	if (spacePos != std::string::npos)
+		sensorI2cAddr = sensorSysName.substr(spacePos + 1);
+
+	if (!sensorI2cAddr.empty()) {
+		std::string autosuspendPath = "/sys/bus/i2c/devices/" +
+					      sensorI2cAddr +
+					      "/power/autosuspend_delay_ms";
+		FILE *f = fopen(autosuspendPath.c_str(), "w");
+		if (f) {
+			fprintf(f, "2000\n");
+			fclose(f);
+			LOG(IPU7, Info) << "Set sensor autosuspend delay to 2000ms"
+					<< " via " << autosuspendPath;
+		} else {
+			LOG(IPU7, Warning) << "Could not set sensor autosuspend "
+					   << "delay: " << autosuspendPath
+					   << " (" << strerror(errno) << ")";
+		}
+	}
 
 	return 0;
 }
@@ -1087,6 +1262,14 @@ int IPU7CameraData::openGraph()
 		return ret;
 
 	graphOpen_ = true;
+
+	/*
+	 * NPU denoiser disabled — the ISP's built-in NR in the ISA node
+	 * already handles noise. The DnCNN model produces <1 level change
+	 * per pixel (effectively identity). Removing it eliminates ~30ms
+	 * CPU overhead per frame at 4K.
+	 */
+
 	return 0;
 }
 
@@ -1126,36 +1309,45 @@ void IPU7CameraData::isysBufferReady(FrameBuffer *buffer)
 		return;
 	}
 
-	processRawFrame(buffer, request);
+	/*
+	 * Only one frame can be in PSYS at a time (terminal buffers are shared).
+	 * Queue if PSYS is busy.
+	 */
+	if (pendingFrame_.eventsRemaining > 0) {
+		psysQueue_.push({ buffer, request });
+		return;
+	}
+
+	submitFrame(buffer, request);
 }
 
-void IPU7CameraData::processRawFrame(FrameBuffer *rawBuffer, Request *request)
+/**
+ * \brief Submit ISA and OFS tasks for a raw frame (async — returns immediately)
+ *
+ * Copies raw data into the ISA input terminal, submits both ISA and OFS
+ * task requests to the firmware, and enables the PSYS EventNotifier for
+ * completion. The firmware handles ISA→OFS data dependencies via the
+ * graph links — both tasks can be submitted upfront.
+ */
+void IPU7CameraData::submitFrame(FrameBuffer *rawBuffer, Request *request)
 {
 	uint8_t frameId = frameCounter_++;
 	uint32_t reuse[2] = { 0, 0 };
 	int ret;
 
 #if IPU7_VERBOSE_FRAME_LOG
-	LOG(IPU7, Debug) << "processRawFrame: frameId=" << static_cast<int>(frameId)
+	LOG(IPU7, Debug) << "submitFrame: frameId=" << static_cast<int>(frameId)
 			 << " rawBuffer seq=" << rawBuffer->metadata().sequence;
 #endif
 
 	/*
 	 * Step 1: Copy raw Bayer data from the ISYS DMA-BUF into the ISA
 	 * input terminal buffer (term_id=5).
-	 *
-	 * The ISYS capture device gives us a DMA-BUF FD containing the raw
-	 * sensor data. We mmap both it and the PSYS terminal buffer, then
-	 * memcpy the data across. This is not zero-copy but is correct.
-	 *
-	 * \todo Use DMA-BUF import to avoid the copy — pass the ISYS FD
-	 * directly as the ISA input terminal buffer.
 	 */
 	{
 		const FrameBuffer::Plane &rawPlane = rawBuffer->planes()[0];
 		unsigned int rawSize = rawPlane.length;
 
-		/* Find the ISA input terminal buffer (term_id=5) */
 		PsysBuffer *isaInputBuf = nullptr;
 		for (auto &tbs : isaTermBufs_) {
 			if (tbs.termId == 5) {
@@ -1169,7 +1361,6 @@ void IPU7CameraData::processRawFrame(FrameBuffer *rawBuffer, Request *request)
 			goto fail;
 		}
 
-		/* mmap the raw ISYS buffer to read sensor data */
 		void *rawData = mmap(nullptr, rawSize, PROT_READ,
 				     MAP_SHARED, rawPlane.fd.get(), 0);
 		if (rawData == MAP_FAILED) {
@@ -1177,10 +1368,6 @@ void IPU7CameraData::processRawFrame(FrameBuffer *rawBuffer, Request *request)
 			goto fail;
 		}
 
-		/*
-		 * Copy raw frame data into ISA input terminal buffer.
-		 * PSYS buffers are backed by userptr — we own the memory directly.
-		 */
 		size_t copySize = std::min(static_cast<size_t>(rawSize),
 					   static_cast<size_t>(isaInputBuf->len));
 		memcpy(isaInputBuf->userptr, rawData, copySize);
@@ -1194,7 +1381,7 @@ void IPU7CameraData::processRawFrame(FrameBuffer *rawBuffer, Request *request)
 	}
 
 	/*
-	 * Step 2: Submit ISA node task request with all terminal buffers.
+	 * Step 2: Submit ISA node task.
 	 */
 	{
 		std::vector<std::pair<uint8_t, PsysBuffer *>> isaTermBufPairs;
@@ -1209,7 +1396,7 @@ void IPU7CameraData::processRawFrame(FrameBuffer *rawBuffer, Request *request)
 	}
 
 	/*
-	 * Step 3: Submit OFS node task request.
+	 * Step 3: Submit OFS node task.
 	 *
 	 * OFS terms 7 and 9 are linked from ISA terms 18 and 19 — they
 	 * share the same physical buffers so the firmware can pass data
@@ -1220,12 +1407,11 @@ void IPU7CameraData::processRawFrame(FrameBuffer *rawBuffer, Request *request)
 		for (auto &tbs : ofsTermBufs_)
 			ofsTermBufPairs.push_back({ tbs.termId, &tbs.buf });
 
-		/* Add shared ISA buffers for linked terminals */
 		for (auto &isaTbs : isaTermBufs_) {
 			if (isaTbs.termId == 19)
-				ofsTermBufPairs.push_back({ 9, &isaTbs.buf }); /* ISA image → OFS */
+				ofsTermBufPairs.push_back({ 9, &isaTbs.buf });
 			else if (isaTbs.termId == 18)
-				ofsTermBufPairs.push_back({ 7, &isaTbs.buf }); /* ISA stats → OFS */
+				ofsTermBufPairs.push_back({ 7, &isaTbs.buf });
 		}
 
 		ret = psys_.taskRequest(graphId_, 1, frameId, reuse, ofsTermBufPairs);
@@ -1236,104 +1422,151 @@ void IPU7CameraData::processRawFrame(FrameBuffer *rawBuffer, Request *request)
 	}
 
 	/*
-	 * Step 4: Wait for both nodes to complete.
-	 *
-	 * \todo This is synchronous and blocks the pipeline. Replace with
-	 * event-driven completion using poll() on the PSYS fd and integrate
-	 * with libcamera's event loop.
+	 * Step 4: Store pending frame state and enable the PSYS notifier.
+	 * The event loop will call psysEventReady() when the firmware signals
+	 * completion of each node (2 events expected: ISA + OFS).
 	 */
-	for (int i = 0; i < 2; i++) {
+	pendingFrame_ = { rawBuffer, request, frameId, 2 };
+	psysNotifier_->setEnabled(true);
+	return;
+
+fail:
+	for (const auto &[stream, buf] : request->buffers()) {
+		buf->_d()->cancel();
+		pipe()->completeBuffer(request, buf);
+	}
+	pipe()->completeRequest(request);
+	availableIsysBuffers_.push(rawBuffer);
+}
+
+/**
+ * \brief Handle PSYS completion events (called by EventNotifier)
+ *
+ * Drains all available completion events from the PSYS fd. When both
+ * ISA and OFS have completed (eventsRemaining reaches 0), calls
+ * completeFrame() to copy the output and signal the application.
+ */
+void IPU7CameraData::psysEventReady()
+{
+	while (pendingFrame_.eventsRemaining > 0) {
 		uint8_t gid, nid, fid;
 		uint32_t error;
-		ret = psys_.dqEvent(&gid, &nid, &fid, &error);
+		int ret = psys_.dqEvent(&gid, &nid, &fid, &error);
+
+		if (ret == -EAGAIN)
+			return; /* No more events ready — wait for next poll */
+
 		if (ret || error) {
 			LOG(IPU7, Error) << "PSYS event error: ret=" << ret
-					 << " error=" << error
-					 << " (waiting for event " << i << "/2)";
-			goto fail;
+					 << " error=" << error;
+			psysNotifier_->setEnabled(false);
+
+			/* Fail the pending frame */
+			Request *request = pendingFrame_.request;
+			FrameBuffer *rawBuffer = pendingFrame_.rawBuffer;
+			pendingFrame_ = {};
+
+			for (const auto &[stream, buf] : request->buffers()) {
+				buf->_d()->cancel();
+				pipe()->completeBuffer(request, buf);
+			}
+			pipe()->completeRequest(request);
+			availableIsysBuffers_.push(rawBuffer);
+			return;
 		}
+
 #if IPU7_VERBOSE_FRAME_LOG
-		LOG(IPU7, Debug) << "PSYS event " << i << ": graph="
-				 << static_cast<int>(gid) << " node="
-				 << static_cast<int>(nid) << " frame="
-				 << static_cast<int>(fid) << " error="
-				 << error;
+		LOG(IPU7, Debug) << "PSYS event: graph=" << static_cast<int>(gid)
+				 << " node=" << static_cast<int>(nid)
+				 << " frame=" << static_cast<int>(fid)
+				 << " remaining=" << (pendingFrame_.eventsRemaining - 1);
 #endif
+
+		pendingFrame_.eventsRemaining--;
 	}
+
+	/* Both ISA and OFS completed — deliver the frame */
+	psysNotifier_->setEnabled(false);
+	completeFrame();
+}
+
+
+/**
+ * \brief Copy processed NV12 output and complete the request
+ *
+ * Called after both ISA and OFS processing events have been received.
+ * Copies the NV12 data from OFS terminal 14 into application buffers,
+ * runs the auto-exposure loop, and signals request completion.
+ */
+void IPU7CameraData::completeFrame()
+{
+	FrameBuffer *rawBuffer = pendingFrame_.rawBuffer;
+	Request *request = pendingFrame_.request;
+	uint8_t frameId = pendingFrame_.frameId;
+	pendingFrame_ = {};
 
 #if IPU7_VERBOSE_FRAME_LOG
 	LOG(IPU7, Debug) << "Frame " << static_cast<int>(frameId)
 			 << " processing complete";
 #endif
 
+	/* Find the OFS output terminal buffer (term_id=14) */
+	PsysBuffer *ofsOutputBuf = nullptr;
+	for (auto &tbs : ofsTermBufs_) {
+		if (tbs.termId == 14) {
+			ofsOutputBuf = &tbs.buf;
+			break;
+		}
+	}
+
+	if (!ofsOutputBuf) {
+		LOG(IPU7, Error) << "OFS output terminal buffer not found";
+		goto fail;
+	}
+
 	/*
-	 * Step 5: Copy the processed NV12 frame from OFS terminal 14 into the
-	 * application's output buffer.
+	 * AE/AWB have internal skip counters (kAeSkipFrames, kAwbSkipFrames)
+	 * that throttle how often they actually compute. Call every frame and
+	 * let the internal counters handle the rate — double-throttling caused
+	 * AE to update only every 12 frames, making convergence far too slow.
 	 */
-	{
-		/* Find the OFS output terminal buffer (term_id=14) */
-		PsysBuffer *ofsOutputBuf = nullptr;
-		for (auto &tbs : ofsTermBufs_) {
-			if (tbs.termId == 14) {
-				ofsOutputBuf = &tbs.buf;
-				break;
-			}
+	updateAutoExposure(ofsOutputBuf->userptr,
+			   outputSize_.width, outputSize_.height);
+	updateAwb(ofsOutputBuf->userptr,
+		  outputSize_.width, outputSize_.height);
+
+	/* Process and deliver to each application output buffer */
+	for (const auto &[stream, buf] : request->buffers()) {
+		const FrameBuffer::Plane &outPlane = buf->planes()[0];
+
+		void *outData = mmap(nullptr, outPlane.length,
+				     PROT_READ | PROT_WRITE,
+				     MAP_SHARED, outPlane.fd.get(), 0);
+		if (outData == MAP_FAILED) {
+			LOG(IPU7, Error) << "Failed to mmap output buffer";
+			continue;
 		}
 
-		if (!ofsOutputBuf) {
-			LOG(IPU7, Error) << "OFS output terminal buffer not found";
-			goto fail;
-		}
+		size_t bytesUsed = std::min(static_cast<size_t>(ofsOutputBuf->len),
+					    static_cast<size_t>(outPlane.length));
 
-		/*
-		 * Run simple auto-exposure on the processed frame.
-		 * Uses OFS output (NV12 Y plane) for luminance feedback.
-		 */
-		updateAutoExposure(ofsOutputBuf->userptr,
-				   outputSize_.width, outputSize_.height);
+		struct dma_buf_sync syncStart = { DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE };
+		ioctl(outPlane.fd.get(), DMA_BUF_IOCTL_SYNC, &syncStart);
 
-		/*
-		 * OFS output buffer is backed by userptr — read directly.
-		 * Copy NV12 data into each application output buffer.
-		 */
-		for (const auto &[stream, buf] : request->buffers()) {
-			const FrameBuffer::Plane &outPlane = buf->planes()[0];
-			void *outData = mmap(nullptr, outPlane.length,
-					     PROT_READ | PROT_WRITE,
-					     MAP_SHARED, outPlane.fd.get(), 0);
-			if (outData == MAP_FAILED) {
-				LOG(IPU7, Error) << "Failed to mmap output buffer: "
-						 << strerror(errno);
-				continue;
-			}
+		memcpy(outData, ofsOutputBuf->userptr, bytesUsed);
+		applyAwb(outData, outputSize_.width, outputSize_.height);
 
-			size_t copySize = std::min(static_cast<size_t>(ofsOutputBuf->len),
-						   static_cast<size_t>(outPlane.length));
+		struct dma_buf_sync syncEnd = { DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE };
+		ioctl(outPlane.fd.get(), DMA_BUF_IOCTL_SYNC, &syncEnd);
 
-			/* Begin DMA-BUF write — ensures cache coherency */
-			struct dma_buf_sync syncStart = { DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE };
-			ioctl(outPlane.fd.get(), DMA_BUF_IOCTL_SYNC, &syncStart);
+		munmap(outData, outPlane.length);
 
-			memcpy(outData, ofsOutputBuf->userptr, copySize);
-
-			/* End DMA-BUF write — flush to consumer */
-			struct dma_buf_sync syncEnd = { DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE };
-			ioctl(outPlane.fd.get(), DMA_BUF_IOCTL_SYNC, &syncEnd);
-
-#if IPU7_VERBOSE_FRAME_LOG
-			LOG(IPU7, Debug) << "Copied " << copySize
-					 << " bytes NV12 to output buffer";
-#endif
-
-			munmap(outData, outPlane.length);
-
-			buf->_d()->metadata().status = FrameMetadata::FrameSuccess;
-			buf->_d()->metadata().sequence = frameId;
-			buf->_d()->metadata().timestamp = rawBuffer->metadata().timestamp;
-			if (!buf->_d()->metadata().planes().empty())
-				buf->_d()->metadata().planes()[0].bytesused = copySize;
-			pipe()->completeBuffer(request, buf);
-		}
+		buf->_d()->metadata().status = FrameMetadata::FrameSuccess;
+		buf->_d()->metadata().sequence = frameId;
+		buf->_d()->metadata().timestamp = rawBuffer->metadata().timestamp;
+		if (!buf->_d()->metadata().planes().empty())
+			buf->_d()->metadata().planes()[0].bytesused = bytesUsed;
+		pipe()->completeBuffer(request, buf);
 	}
 
 	request->_d()->metadata().set(controls::SensorTimestamp,
@@ -1346,6 +1579,13 @@ void IPU7CameraData::processRawFrame(FrameBuffer *rawBuffer, Request *request)
 
 	pipe()->completeRequest(request);
 	availableIsysBuffers_.push(rawBuffer);
+
+	/* Submit next queued frame to PSYS if any */
+	if (!psysQueue_.empty()) {
+		auto [nextRaw, nextReq] = psysQueue_.front();
+		psysQueue_.pop();
+		submitFrame(nextRaw, nextReq);
+	}
 	return;
 
 fail:
@@ -1355,6 +1595,13 @@ fail:
 	}
 	pipe()->completeRequest(request);
 	availableIsysBuffers_.push(rawBuffer);
+
+	/* Submit next queued frame even on failure */
+	if (!psysQueue_.empty()) {
+		auto [nextRaw, nextReq] = psysQueue_.front();
+		psysQueue_.pop();
+		submitFrame(nextRaw, nextReq);
+	}
 }
 
 /**
@@ -1407,8 +1654,8 @@ void IPU7CameraData::updateAutoExposure(const void *nv12Data,
 	 * by (target / current) but dampen to avoid oscillation.
 	 */
 	float ratio = static_cast<float>(targetLuma) / std::max(avgLuma, uint8_t(1));
-	/* Dampen: move only 40% of the way toward the target */
-	ratio = 1.0f + (ratio - 1.0f) * 0.4f;
+	/* Dampen: move 60% of the way toward the target */
+	ratio = 1.0f + (ratio - 1.0f) * 0.6f;
 	/* Clamp ratio to avoid wild swings */
 	ratio = std::max(0.5f, std::min(ratio, 2.0f));
 
@@ -1437,12 +1684,19 @@ void IPU7CameraData::updateAutoExposure(const void *nv12Data,
 			ae_.digitalGain = static_cast<int32_t>(newDGain);
 		}
 	}
-	/* If too bright, reduce in reverse order */
-	if (ae_.exposure <= kAeExposureMin && error < 0) {
-		float newAGain = ae_.analogueGain * ratio;
-		newAGain = std::max(static_cast<float>(kAeAGainMin),
-				    std::min(newAGain, static_cast<float>(kAeAGainMax)));
-		ae_.analogueGain = static_cast<int32_t>(newAGain);
+	/* If too bright, reduce in reverse order: digital → analogue → exposure */
+	if (error < 0) {
+		if (ae_.digitalGain > kAeDGainMin) {
+			float newDGain = ae_.digitalGain * ratio;
+			newDGain = std::max(static_cast<float>(kAeDGainMin),
+					    std::min(newDGain, static_cast<float>(kAeDGainMax)));
+			ae_.digitalGain = static_cast<int32_t>(newDGain);
+		} else if (ae_.analogueGain > kAeAGainMin) {
+			float newAGain = ae_.analogueGain * ratio;
+			newAGain = std::max(static_cast<float>(kAeAGainMin),
+					    std::min(newAGain, static_cast<float>(kAeAGainMax)));
+			ae_.analogueGain = static_cast<int32_t>(newAGain);
+		}
 	}
 
 	/* Apply to sensor */
@@ -1459,6 +1713,99 @@ void IPU7CameraData::updateAutoExposure(const void *nv12Data,
 			 << " again=" << ae_.analogueGain
 			 << " dgain=" << ae_.digitalGain;
 #endif
+}
+
+/**
+ * \brief Gray-world AWB: compute UV correction from NV12 chroma
+ *
+ * Samples UV pairs on a grid, computes average chrominance, and derives
+ * correction offsets to shift the gray-world mean toward neutral (128, 128).
+ * Uses damped proportional control to avoid oscillation.
+ */
+void IPU7CameraData::updateAwb(const void *nv12Data, unsigned int width,
+				unsigned int height)
+{
+	if (!awb_.enabled)
+		return;
+
+	if (++awb_.framesSinceUpdate < kAwbSkipFrames)
+		return;
+	awb_.framesSinceUpdate = 0;
+
+	const uint8_t *uvPlane = static_cast<const uint8_t *>(nv12Data)
+				 + width * height;
+	unsigned int uvWidth = width;
+	unsigned int uvHeight = height / 2;
+
+	/* Sample on a 32×32 grid of UV pairs */
+	unsigned int stepX = std::max(uvWidth / 64, 1u) * 2; /* step in bytes, 2 per UV pair */
+	unsigned int stepY = std::max(uvHeight / 32, 1u);
+	uint64_t uSum = 0, vSum = 0;
+	unsigned int count = 0;
+
+	for (unsigned int y = 0; y < uvHeight; y += stepY) {
+		const uint8_t *row = uvPlane + y * uvWidth;
+		for (unsigned int x = 0; x < uvWidth; x += stepX) {
+			uSum += row[x];
+			vSum += row[x + 1];
+			count++;
+		}
+	}
+
+	if (count == 0)
+		return;
+
+	float avgU = static_cast<float>(uSum) / count;
+	float avgV = static_cast<float>(vSum) / count;
+
+	/*
+	 * Gray-world: for a neutral scene, average U and V should be 128.
+	 * Compute correction to push averages toward neutral.
+	 */
+	float uError = 128.0f - avgU;
+	float vError = 128.0f - avgV;
+
+	/* Damped update to avoid oscillation */
+	awb_.uCorrection += (uError - awb_.uCorrection) * kAwbDamping;
+	awb_.vCorrection += (vError - awb_.vCorrection) * kAwbDamping;
+
+	/* Clamp correction range */
+	awb_.uCorrection = std::max(-kAwbMaxCorrection,
+				    std::min(awb_.uCorrection, kAwbMaxCorrection));
+	awb_.vCorrection = std::max(-kAwbMaxCorrection,
+				    std::min(awb_.vCorrection, kAwbMaxCorrection));
+
+#if IPU7_VERBOSE_FRAME_LOG
+	LOG(IPU7, Debug) << "AWB: avgU=" << avgU << " avgV=" << avgV
+			 << " corrU=" << awb_.uCorrection
+			 << " corrV=" << awb_.vCorrection;
+#endif
+}
+
+/**
+ * \brief Apply AWB correction to NV12 UV plane in-place
+ */
+void IPU7CameraData::applyAwb(void *nv12Data, unsigned int width,
+				unsigned int height)
+{
+	if (!awb_.enabled)
+		return;
+
+	/* Skip if correction is negligible */
+	if (std::abs(awb_.uCorrection) < 0.5f && std::abs(awb_.vCorrection) < 0.5f)
+		return;
+
+	uint8_t *uvPlane = static_cast<uint8_t *>(nv12Data) + width * height;
+	unsigned int uvSize = width * (height / 2);
+	int uCorr = static_cast<int>(awb_.uCorrection);
+	int vCorr = static_cast<int>(awb_.vCorrection);
+
+	for (unsigned int i = 0; i < uvSize; i += 2) {
+		int u = uvPlane[i] + uCorr;
+		int v = uvPlane[i + 1] + vCorr;
+		uvPlane[i] = static_cast<uint8_t>(std::max(0, std::min(255, u)));
+		uvPlane[i + 1] = static_cast<uint8_t>(std::max(0, std::min(255, v)));
+	}
 }
 
 REGISTER_PIPELINE_HANDLER(PipelineHandlerIPU7, "ipu7")

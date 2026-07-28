@@ -112,6 +112,7 @@ public:
 	int open(const std::string &deviceNode);
 	void close();
 	bool isOpen() const { return fd_.isValid(); }
+	int fd() const { return fd_.isValid() ? fd_.get() : -1; }
 
 	int graphOpen(std::vector<PsysNode> &nodes,
 		      const std::vector<PsysLink> &links,
