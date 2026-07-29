@@ -550,8 +550,33 @@ int PipelineHandlerIPU7::exportFrameBuffers(Camera *camera, Stream *stream,
 			 << " size=" << cfg.size << " format=" << cfg.pixelFormat
 			 << " frameSize=" << cfg.frameSize;
 
+	/*
+	 * Export NV12 as TWO planes (Y then UV), not one.
+	 *
+	 * Applications index planes by what the format declares: qcam's software
+	 * NV12 converter asks for plane 1 and aborts on
+	 * `plane < planes_.size()` when only one was exported. Exporting a
+	 * single frameSize-length plane worked for `cam` and for PipeWire, which
+	 * is why this survived unnoticed.
+	 *
+	 * DmaBufAllocator::createBuffer sums the sizes into ONE dmabuf and gives
+	 * each plane an offset into it, so the memory stays contiguous and the
+	 * copy path can still map the whole frame in one go.
+	 *
+	 * uvSize is derived by subtraction rather than computed, so the total
+	 * always matches the frameSize validate() already agreed with the
+	 * application.
+	 */
+	const unsigned int ySize = cfg.stride * cfg.size.height;
+	if (cfg.frameSize <= ySize) {
+		LOG(IPU7, Error) << "frameSize " << cfg.frameSize
+				 << " <= Y plane " << ySize;
+		return -EINVAL;
+	}
+	const unsigned int uvSize = cfg.frameSize - ySize;
+
 	return data->dmaBufAllocator_.exportBuffers(count,
-		{ cfg.frameSize }, buffers);
+		{ ySize, uvSize }, buffers);
 }
 
 int PipelineHandlerIPU7::start(Camera *camera,
@@ -1539,7 +1564,17 @@ void IPU7CameraData::completeFrame()
 	for (const auto &[stream, buf] : request->buffers()) {
 		const FrameBuffer::Plane &outPlane = buf->planes()[0];
 
-		void *outData = mmap(nullptr, outPlane.length,
+		/*
+		 * All planes share one dmabuf (see exportFrameBuffers), so map
+		 * the whole frame once from offset 0 rather than per plane --
+		 * NV12's Y and UV are contiguous and the memcpy below writes
+		 * both in a single pass.
+		 */
+		size_t mapLen = 0;
+		for (const FrameBuffer::Plane &p : buf->planes())
+			mapLen += p.length;
+
+		void *outData = mmap(nullptr, mapLen,
 				     PROT_READ | PROT_WRITE,
 				     MAP_SHARED, outPlane.fd.get(), 0);
 		if (outData == MAP_FAILED) {
@@ -1548,7 +1583,7 @@ void IPU7CameraData::completeFrame()
 		}
 
 		size_t bytesUsed = std::min(static_cast<size_t>(ofsOutputBuf->len),
-					    static_cast<size_t>(outPlane.length));
+					    mapLen);
 
 		struct dma_buf_sync syncStart = { DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE };
 		ioctl(outPlane.fd.get(), DMA_BUF_IOCTL_SYNC, &syncStart);
@@ -1559,13 +1594,22 @@ void IPU7CameraData::completeFrame()
 		struct dma_buf_sync syncEnd = { DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE };
 		ioctl(outPlane.fd.get(), DMA_BUF_IOCTL_SYNC, &syncEnd);
 
-		munmap(outData, outPlane.length);
+		munmap(outData, mapLen);
 
 		buf->_d()->metadata().status = FrameMetadata::FrameSuccess;
 		buf->_d()->metadata().sequence = frameId;
 		buf->_d()->metadata().timestamp = rawBuffer->metadata().timestamp;
-		if (!buf->_d()->metadata().planes().empty())
-			buf->_d()->metadata().planes()[0].bytesused = bytesUsed;
+		/* Per-plane bytesused, or applications see an empty UV plane. */
+		size_t left = bytesUsed;
+		unsigned int pi = 0;
+		for (auto &mp : buf->_d()->metadata().planes()) {
+			size_t cap = pi < buf->planes().size()
+					   ? buf->planes()[pi].length : 0;
+			size_t n = std::min(left, cap);
+			mp.bytesused = n;
+			left -= n;
+			pi++;
+		}
 		pipe()->completeBuffer(request, buf);
 	}
 
