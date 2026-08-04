@@ -56,6 +56,14 @@ The camera must be free — psys does not share, and PipeWire holds it:
 systemctl --user stop wireplumber pipewire pipewire.socket
 ```
 
+The HAL writes its tuning cache to `/run/camera`, which does not exist and
+which a normal user cannot create -- `/run` is root-owned. Without it the HAL
+errors out before it ever opens a graph:
+
+```bash
+sudo mkdir -p /run/camera && sudo chown "$(id -u):$(id -g)" /run/camera
+```
+
 Then run a capture through the HAL:
 
 ```bash
@@ -87,6 +95,13 @@ matching `isaProfile` in `ipu7.cpp`.
 
 ## Caveats
 
+- **Use a pipeline that actually streams on your machine.** The shim only
+  fires on `IPU_IOC_GRAPH_OPEN`, so if the HAL errors out before it submits a
+  graph you get an empty output file and it looks like the shim failed. A HAL
+  run that ends in
+  `SensorHwCtrl: sensor output sub device is not set` followed by `Got EOS`
+  after about a second never got that far. If some other pipeline gives you
+  frames -- `icamerasrc ! ... ! v4l2sink`, for instance -- trace *that* one.
 - **`icamerasrc` may segfault**, and that is not this shim's fault — verify by
   running the same command without `LD_PRELOAD`. The HAL only works on boards
   it has an `.aiqb` and GCSS descriptor for. It segfaults on the author's PTL
