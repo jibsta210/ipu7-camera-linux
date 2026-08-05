@@ -93,6 +93,26 @@ LD_PRELOAD=$PWD/graph-trace.so GRAPH_TRACE_OUT=/tmp/graph-libcamera.txt \
 On a PTL machine that prints `teb = { 0x000c3d27, 0x00000000 }` for node 0,
 matching `isaProfile` in `ipu7.cpp`.
 
+## Reading the output when nothing is captured
+
+The shim announces itself from a constructor and reports at exit, so an empty
+or unhelpful file still tells you something:
+
+```
+graph-trace: loaded into pid N          <- shim is in the process
+graph-trace: ioctl fd=21 ... [psys]     <- device is open, ioctls flowing
+graph-trace: GRAPH_OPEN via ioctl()     <- caught it
+```
+
+| what you see | what it means |
+|---|---|
+| no `loaded into pid` at all | `LD_PRELOAD` did not take -- wrong path, or the pipeline runs the camera in a different process |
+| `loaded` but no `[psys]` lines | that process never touched `/dev/ipu7-psys*` |
+| `[psys]` lines but no `GRAPH_OPEN` | the device is open and the graph went out under a different ioctl number -- the logged `req=` values are then the interesting part |
+| `GRAPH_OPEN via syscall()` | the caller bypassed the libc wrapper; caught anyway |
+
+`GRAPH_TRACE_VERBOSE=1` logs every ioctl on every fd, not just psys ones.
+
 ## Caveats
 
 - **Use a pipeline that actually streams on your machine.** The shim only
