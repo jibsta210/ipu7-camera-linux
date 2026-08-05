@@ -95,6 +95,18 @@ struct ipu_psys_graph_info {
 
 #define IPU_IOC_GRAPH_OPEN _IOWR('A', 7, struct ipu_psys_graph_info)
 
+/*
+ * Compare the low 32 bits only.
+ *
+ * ioctl() is varargs, so the request arrives as whatever integer type the
+ * caller passed. The Intel HAL passes an int, which sign-extends on the way in:
+ * GRAPH_OPEN shows up as 0xffffffffc06e4107, not 0x00000000c06e4107. A plain
+ * equality test against the constant therefore never matches, and the shim
+ * reports "NO GRAPH_OPEN was seen" while the ioctl is sitting right there in
+ * the verbose log. Request numbers are 32-bit; the top half is noise.
+ */
+#define IS_GRAPH_OPEN(r) (((uint32_t)(r)) == ((uint32_t)IPU_IOC_GRAPH_OPEN))
+
 static FILE *out;
 static int   seen, verbose;
 
@@ -267,7 +279,7 @@ static void watch(int fd, unsigned long req, void *arg, const char *via)
 {
 	int psys = fd_is_psys(fd);
 
-	if (req == (unsigned long)IPU_IOC_GRAPH_OPEN && arg) {
+	if (IS_GRAPH_OPEN(req) && arg) {
 		fprintf(sink(), "graph-trace: GRAPH_OPEN via %s on fd=%d\n", via, fd);
 		dump((const struct ipu_psys_graph_info *)arg);
 	} else if (psys || verbose) {
@@ -294,7 +306,7 @@ int ioctl(int fd, unsigned long req, ...)
 
 	watch(fd, req, arg, "ioctl()");
 	int ret = real(fd, req, arg);
-	if (req == (unsigned long)IPU_IOC_GRAPH_OPEN)
+	if (IS_GRAPH_OPEN(req))
 		fprintf(sink(), "graph-trace: GRAPH_OPEN returned %d%s\n",
 			ret, ret < 0 ? " (FAILED)" : "");
 	return ret;
