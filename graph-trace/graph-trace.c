@@ -49,7 +49,17 @@
 #define MAX_GRAPH_NODES          5U
 #define MAX_GRAPH_LINKS          10U
 #define MAX_GRAPH_NODE_PROFILES  1U
-#define MAX_GRAPH_TERMINALS      64U
+/*
+ * These MUST match uapi/ipu7-psys.h exactly. struct graph_node embeds
+ * terminals[MAX_GRAPH_TERMINALS] by value, so this constant IS the stride of
+ * the nodes array. Getting it wrong does not fail loudly -- node[0] still
+ * decodes perfectly because it sits at offset 0, and every later node is read
+ * from the wrong place. With 64 here against a header value of 32 the stride
+ * was 379 instead of 219, and node[1] came out as all zeros on both a Panther
+ * Lake and a Lunar Lake capture, which read as "the HAL only filled one node"
+ * rather than as a bug in this file.
+ */
+#define MAX_GRAPH_TERMINALS      32U
 
 struct node_profile {
 	uint32_t teb[2];
